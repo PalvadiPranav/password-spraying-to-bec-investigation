@@ -1,0 +1,10 @@
+# Keep the exercise answer material out of the repo
+*Answer_Key*
+*Student_Guide*
+*Incident_Report_Example*
+*Incident_Report_Template*
+CEO_Account_Takeover___Project_Pack.zip
+Project Pack 1/
+__MACOSX/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,172 @@
+// ============================================================================
+//  CLOUDORA  |  KQL QUERY PACK  -  CEO Account Takeover investigation
+//  Ticket CLD-0001 - Suspicious sign-in activity: daniel.reeve@cloudora.io
+//  MyFirstHack  |  myfirstcyberjob community resource
+// ============================================================================
+//
+//  HOW TO USE THIS FILE
+//  - Every query from the Student Guide is here, in order, ready to copy-paste.
+//  - Load the data into Azure Data Explorer (dataexplorer.azure.com) and name
+//    the two tables EXACTLY:  CloudoraSignIn_CL  and  CloudoraAudit_CL
+//    (keep the _CL suffix - every query below expects those exact names).
+//  - At ingestion, set the column types: TimeGenerated = datetime, and
+//    ResultType = string. Data Explorer guesses ResultType is a number because
+//    it is all digits; if you leave it numeric, the failed-login queries below
+//    (which match ResultType as text, e.g. "50126") return nothing.
+//  - Data Explorer has no global time-range picker - the dates live inside the
+//    queries. All timestamps in the data are UTC; keep your report in UTC too.
+//  - This is the same KQL that runs in Microsoft Sentinel, so the skill and
+//    every query here transfer to Sentinel one-to-one.
+//
+//  Lines starting with // are comments. KQL ignores them, so you can paste
+//  whole blocks including the comments.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+//  STEP 0 - SANITY CHECK: did the data ingest correctly?
+// ----------------------------------------------------------------------------
+//  count just returns the number of rows in the table.
+//  Expected result: ~1,479 rows. If you see 0, your time range is wrong or
+//  ingestion failed. Fix this before doing anything else - every query below
+//  depends on it.
+
+CloudoraSignIn_CL
+| count
+
+
+// ----------------------------------------------------------------------------
+//  STEP 1 - TRIAGE THE ALERT: is the Lagos sign-in real?
+// ----------------------------------------------------------------------------
+//  Pull every sign-in for the CEO on the incident day and read the story in
+//  the timestamps.
+//
+//  Line by line:
+//  - where UserPrincipalName == ...   filter to one account (== is exact match)
+//  - where TimeGenerated between ...  only the incident day, 10 Aug 00:00 to
+//                                     11 Aug 00:00 UTC
+//  - project ...                      keep only the columns you need to read
+//  - order by TimeGenerated asc       oldest first, so it reads like a story
+//
+//  What you should see: failures at 03:09 and 03:10 from 102.89.44.17 (Lagos),
+//  ResultType 0 (Success) at 03:12, Outlook Web at 03:14, Azure Portal at
+//  03:26 - then Daniel's own London sign-in at 08:41. One account, two cities,
+//  five and a half hours apart.
+
+CloudoraSignIn_CL
+| where UserPrincipalName == "daniel.reeve@cloudora.io"
+| where TimeGenerated between (datetime(2026-08-10) .. datetime(2026-08-11))
+| project TimeGenerated, AppDisplayName, IPAddress, City, Country, ResultType, ResultDescription
+| order by TimeGenerated asc
+
+
+// ----------------------------------------------------------------------------
+//  STEP 2 - RULE OUT THE INNOCENT EXPLANATION: baseline the account
+// ----------------------------------------------------------------------------
+//  Before you call something malicious, learn what normal looks like.
+//  summarize groups rows: here we count sign-ins per location and grab the
+//  first and last time each location was seen.
+//
+//  - summarize ... by Country, City, IPAddress   one row per unique location
+//  - count()            how many sign-ins from that location
+//  - min()/max()        first and last time it appeared
+//
+//  Expected: 8 days of London, then Lagos appearing only around 3AM with
+//  failures in front of it. That is not a VPN and not travel.
+
+CloudoraSignIn_CL
+| where UserPrincipalName == "daniel.reeve@cloudora.io"
+| summarize SignIns=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated) by Country, City, IPAddress
+| order by SignIns desc
+
+//  Now run the exact same baseline for omar.farah@cloudora.io - the OTHER
+//  account with a new country this week (Dubai). Swap one line:
+//  daytime hours, success first try, his usual iOS device, across three days.
+//  That pattern is travel. Daniel's pattern is not. This comparison is the
+//  core judgment skill of the whole project.
+
+CloudoraSignIn_CL
+| where UserPrincipalName == "omar.farah@cloudora.io"
+| summarize SignIns=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated) by Country, City, IPAddress
+| order by SignIns desc
+
+
+// ----------------------------------------------------------------------------
+//  STEP 3 - FIND THE ATTACK THAT CAME FIRST: hunt for credential attacks
+// ----------------------------------------------------------------------------
+//  A successful attacker login means the password was obtained somehow.
+//  ResultType 50126 = "Invalid username or password" - failed credential
+//  attempts. Group all failures by source IP:
+//
+//  - Failures=count()                    total failed attempts from that IP
+//  - TargetedAccounts=dcount(UserPrincipalName)
+//                                        how many DIFFERENT accounts that IP
+//                                        went after (dcount = distinct count)
+//
+//  The tell: the Lagos IPs (102.89.44.17, 102.89.44.23, 102.89.45.101) show
+//  failures spread across 25+ different accounts, one to three tries each.
+//  Few attempts per account, many accounts = password spray (MITRE T1110.003),
+//  built to stay under account-lockout thresholds.
+
+CloudoraSignIn_CL
+| where ResultType == "50126"
+| summarize Failures=count(), TargetedAccounts=dcount(UserPrincipalName) by IPAddress, Country
+| order by Failures desc
+
+//  Confirm the attack window. bin(TimeGenerated, 1d) buckets rows into days,
+//  so you can see the spray ran across three consecutive nights (Aug 8, 9, 10)
+//  before the success landed on the 10th.
+
+CloudoraSignIn_CL
+| where IPAddress startswith "102.89."
+| summarize Attempts=count() by bin(TimeGenerated, 1d), ResultType
+
+
+// ----------------------------------------------------------------------------
+//  STEP 4 - CHECK FOR PERSISTENCE: what did they change after getting in?
+// ----------------------------------------------------------------------------
+//  Attackers assume they will be caught, so they build back doors. Switch to
+//  the AUDIT table and pull every change made from attacker infrastructure.
+//
+//  Expected findings:
+//  - 03:18 "User registered security info" - attacker added their own
+//    authenticator app, device 'Pixel 6' (MITRE T1098.005). They now survive
+//    a password reset.
+//  - 03:31 "New inbox rule created" - rule 'RSS Subscriptions' hides any mail
+//    from finance or containing 'invoice' (MITRE T1564.008). Classic staging
+//    for invoice fraud / BEC.
+//  This is why "just reset the password" fails as a response.
+
+CloudoraAudit_CL
+| where IPAddress startswith "102.89."
+| project TimeGenerated, ActivityDisplayName, TargetUser, Details
+| order by TimeGenerated asc
+
+
+// ----------------------------------------------------------------------------
+//  STEP 5 - SCOPE IT: is anyone else compromised?
+// ----------------------------------------------------------------------------
+//  Never assume one victim. Filter to attacker IPs AND ResultType 0 (success)
+//  to list every account the attacker infrastructure actually got into.
+//
+//  Document every account this returns. One of them is not Daniel - that is
+//  your task (see the Student Guide and the Answer Key).
+
+CloudoraSignIn_CL
+| where IPAddress startswith "102.89." and ResultType == "0"
+| summarize by UserPrincipalName, IPAddress, TimeGenerated
+| order by TimeGenerated asc
+
+
+// ----------------------------------------------------------------------------
+//  STEPS 6 & 7 - CONTAIN AND REPORT
+// ----------------------------------------------------------------------------
+//  No new queries here. Step 6 is containment (revoke sessions, reset
+//  credentials, remove the attacker MFA method, delete the inbox rule, block
+//  the attacker IPs) - then VERIFY by re-running the Step 1 and Step 5 queries
+//  and confirming no attacker activity after your containment time.
+//  Step 7 is the report: fill CLD-IR-TEMPLATE, then compare with CLD-IR-0001.
+//
+//  Task queries are NOT in this pack on purpose - write them yourself
+//  first, then check the Answer Key (CLD-0001 Answer Key) in the community.
+// ============================================================================
